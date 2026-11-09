@@ -1,0 +1,143 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // تعتمد الصلاحيات على Firebase Authentication وملف موثوق في users/{uid}.
+    // لا يستطيع المستخدم إنشاء دوره أو تغييره من التطبيق.
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function profile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function hasRole(role) {
+      return signedIn() && profile().role == role;
+    }
+
+    function isAdmin() {
+      return hasRole('admin');
+    }
+
+    function ownsStudentCase(data) {
+      return hasRole('student') && data.sid == profile().studentId;
+    }
+
+    function assignedDoctor(data) {
+      return hasRole('doctor') && data.clinic == profile().clinic;
+    }
+
+    // فرض انتقالات حالة الطلب على الخادم، وليس على واجهة المستخدم فقط.
+    function validStudentStatusChange() {
+      return request.resource.data.status == resource.data.status ||
+        (resource.data.status == 'draft' &&
+          request.resource.data.status in ['sent', 'closed']) ||
+        (resource.data.status == 'sent' &&
+          request.resource.data.status == 'closed') ||
+        (resource.data.status == 'started' &&
+          request.resource.data.status in ['fin', 'closed']) ||
+        (resource.data.status == 'fin' &&
+          request.resource.data.status == 'closed');
+    }
+
+    function validDoctorStatusChange() {
+      return request.resource.data.status == resource.data.status ||
+        (resource.data.status == 'sent' &&
+          request.resource.data.status == 'started') ||
+        (resource.data.status == 'fin' &&
+          request.resource.data.status == 'finished');
+    }
+
+    match /users/{uid} {
+      // المستخدم يقرأ ملفه فقط؛ الأدمن وحده ينشئ الحسابات ويغيّر الأدوار.
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow write: if isAdmin();
+    }
+
+    match /config/{id} {
+      // الإعدادات والجدول متاحان للمستخدمين المسجّلين؛ التعديل للأدمن فقط.
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    match /cases/{caseId} {
+      // يجب على استعلام الطالب/الدكتور التصفية حسب sid/clinic.
+      // قواعد Firestore ترفض الاستعلام غير المقيّد ولا تحذف النتائج غير المصرّح بها.
+      allow read: if isAdmin() || ownsStudentCase(resource.data) || assignedDoctor(resource.data);
+      allow create: if isAdmin() || (
+        hasRole('student') &&
+        request.resource.data.sid == profile().studentId &&
+        request.resource.data.sname == profile().name &&
+        request.resource.data.group == profile().group &&
+        request.resource.data.status == 'draft' &&
+        request.resource.data.clinic in ['surgery', 'perio', 'braces', 'fill', 'ortho'] &&
+        get(/databases/$(database)/documents/config/main).data
+          .clinics[request.resource.data.clinic].on == 1
+      );
+      allow update: if isAdmin() || (
+        ownsStudentCase(resource.data) &&
+        request.resource.data.sid == resource.data.sid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'f', 'med', 'teeth', 'help', 'stages', 'status', 'sent_at', 'fin_at'
+        ]) &&
+        request.resource.data.status in ['draft', 'sent', 'started', 'fin', 'closed'] &&
+        validStudentStatusChange()
+      ) || (
+        assignedDoctor(resource.data) &&
+        request.resource.data.clinic == resource.data.clinic &&
+        request.resource.data.sid == resource.data.sid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status', 'doctor', 'started_at', 'finished_at', 'help', 'ev', 'stages'
+        ]) &&
+        validDoctorStatusChange()
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /swaps/{swapId} {
+      // بيانات البدائل تشغيلية ومشتركة ليتمكن الطلاب من إيجاد بديل متاح.
+      // تبقى الكيس شيتات وبيانات المرضى خاصة.
+      allow read: if signedIn();
+      allow create: if isAdmin() || (
+        hasRole('student') &&
+        request.resource.data.giver == profile().studentId
+      );
+      allow update: if isAdmin() || (
+        hasRole('student') &&
+        (resource.data.giver == profile().studentId || resource.data.taker == profile().studentId) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'used'])
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /svc/{serviceId} {
+      // الطالب يرى طلباته، والدكتور طلبات عيادته، والموظف/الأدمن قائمة الخدمات.
+      allow read: if isAdmin() || hasRole('staff') || ownsStudentCase(resource.data) || (
+        hasRole('doctor') && resource.data.clinic == profile().clinic
+      );
+      allow create: if isAdmin() || (
+        hasRole('student') &&
+        request.resource.data.sid == profile().studentId
+      );
+      allow update: if isAdmin() || (
+        ownsStudentCase(resource.data) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])
+      ) || (
+        hasRole('staff') &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'done_at'])
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /meta/{metaId} {
+      // حالة تواجد الموظف مرئية للمستخدمين المسجّلين؛ التحديث للموظف/الأدمن.
+      allow read: if signedIn();
+      allow write: if isAdmin() || hasRole('staff');
+    }
+
+    // أي مجموعة غير مذكورة أدناه متاحة للأدمن فقط إلى أن تُضاف لها قاعدة دقيقة.
+    match /{document=**} {
+      allow read, write: if isAdmin();
+    }
+  }
+}
